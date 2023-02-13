@@ -166,7 +166,7 @@ class MailersendEmailBackend(BaseEmailBackend):
 
     def __init__(self):
         super().__init__()
-        # self.mailer = emails.NewEmail(settings.BIRDSONG_MAILERSEND_API_KEY) # TODO: uncomment
+        self.mailer = emails.NewEmail(settings.BIRDSONG_MAILERSEND_API_KEY)
 
     def parse_response(self, response):
         """
@@ -197,6 +197,7 @@ class MailersendEmailBackend(BaseEmailBackend):
 
     def get_bulk_status_by_id(self, bulk_email_id):
         """
+        TODO: Elaborate
         {
             'data': {
                 'id': '63e9130bdcbf5643050513cb',
@@ -213,7 +214,7 @@ class MailersendEmailBackend(BaseEmailBackend):
         }
         """
 
-        # return self.parse_response(self.mailer.get_bulk_status_by_id(bulk_email_id)) # TODO: uncomment
+        return self.parse_response(self.mailer.get_bulk_status_by_id(bulk_email_id))
         return (None, {'data': {'id': '63e967350ee94e23c308236a', 'state': 'completed', 'total_recipients_count': 4, 'suppressed_recipients_count': 1, 'suppressed_recipients': {'63e967365ec84f8724074ce3': {'to': [{'email': 'underlivaerable@raquel.yoga', 'name': None, 'reasons': ['on_hold']}]}}, 'validation_errors_count': 2, 'validation_errors': {'message.1': {'to.0.email': ['Recipient domain must match senders domain.']}, 'message.3': {'to.0.email': ['Recipient domain must match senders domain.']}}, 'messages_id': ['63e967365ec84f8724074ce2', '63e967365ec84f8724074ce3'], 'created_at': '2023-02-12T22:24:53.707000Z', 'updated_at': '2023-02-12T22:24:54.384000Z'}})
         text = '{"message":"Resource not found."}'
         return self.parse_response(text)
@@ -227,8 +228,8 @@ class MailersendEmailBackend(BaseEmailBackend):
         :param email_list: List of email dictionaries - @see https://github.com/mailersend/mailersend-python#send-bulk-email
         :return: {"message":"The bulk email is being processed.","bulk_email_id":"63dc744e837a822014066875"}
         """
-        # return self.parse_response(self.mailer.send_bulk(self.get_email_list(messages))) # TODO: uncomment
-        return self.parse_response('429\n{\n\t"message": "Daily API quota limit was reached."\n}')
+        return self.parse_response(self.mailer.send_bulk(self.get_email_list(messages)))
+        # return self.parse_response('429\n{\n\t"message": "Daily API quota limit was reached."\n}')
         # text = "{\"message\":\"The bulk email is being processed.\",\"bulk_email_id\":\"63dc744e837a822014066875\"}"
         # text = "{\"message\":\"The bulk email is being processed.\",\"bulk_email_id\":\"63e9130bdcbf5643050513cb\"}"
         # return self.parse_response(f"202\n{text}")
