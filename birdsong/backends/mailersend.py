@@ -18,8 +18,22 @@ from mailersend import emails
 
 logger = logging.getLogger(__name__)
 
+ERROR_CODE_UNAUTHORIZED = 403
 ERROR_CODE_DAILY_API_QUOTA_LIMIT_REACHED = 429
+ERROR_CODE_BULK_EMAIL_NOT_FOUND = "Resource not found." # Unfortunately there's no code for this error so we shall use the message instead
+ERROR_CODE_BULK_CHECK_TIMED_OUT = 5001 # Used internally in the backend, not actually returned back by MailerSend
+ERROR_CODES = {
+    ERROR_CODE_UNAUTHORIZED: CampaignStatus.UNSENT,
+    ERROR_CODE_DAILY_API_QUOTA_LIMIT_REACHED: CampaignStatus.UNSENT,
+    ERROR_CODE_BULK_EMAIL_NOT_FOUND: CampaignStatus.UNSENT,
+    ERROR_CODE_BULK_CHECK_TIMED_OUT: CampaignStatus.SENDING,
+}
+
+ERROR_MESSAGE_UNAUTHORIZED = _("This action is unauthorized")
 ERROR_MESSAGE_DAILY_API_QUOTA_LIMIT_REACHED = _("Daily API quota limit was reached")
+ERROR_MESSAGE_BULK_EMAIL_NOT_FOUND = _("Unable to find bulk email resource")
+ERROR_MESSAGE_BULK_CHECK_TIMED_OUT = _("Checking bulk email status timed out") # TODO: Provide ways to re-check automatically or at least manually
+
 BULK_STATE_COMPLETED = "completed"
 
 class MailerSendException(Exception):
@@ -29,6 +43,7 @@ class MailerSendException(Exception):
     def __init__(self, message, code):            
         super().__init__(message)
         self.code = code
+        self.message = message
 
 
 class SendCampaignThread(Thread):
@@ -54,6 +69,7 @@ class SendCampaignThread(Thread):
             with transaction.atomic():
                 (code, response) = self.backend.send_bulk(self.email_messages)
                 if self.test_send: # Is this a Send test?
+                    # messages.success(self.request, _("Test email sent, please check your inbox"))
                     return # no need to continue any further
                 logger.info(f"Campaign information passed over to MailerSend.")
                 logger.debug(f"Parsed code: {code}, response: {response}") # TODO: Test debug logs, possibly remove them altogether
@@ -62,19 +78,20 @@ class SendCampaignThread(Thread):
             
         except MailerSendException as e:
             logger.exception(f"Problem sending campaign id=\"{self.campaign.id}\" due to a MailerSend error")
-            self.clear_messages(self.request)
             error_message = _("Failed to send campaign") + f" {self.campaign.name} " + _("due to a MailerSend error")
-            if e.code == ERROR_CODE_DAILY_API_QUOTA_LIMIT_REACHED:
-                messages.error(self.request, f"{error_message}: \"{ERROR_MESSAGE_DAILY_API_QUOTA_LIMIT_REACHED}\"")
-            else:
-                messages.error(self.request, error_message)
+            campaign_fallback_status = CampaignStatus.UNSENT
+            if e.code in ERROR_CODES.keys():
+                error_message += f": \"{e.message}\""
+                campaign_fallback_status = ERROR_CODES.get(e.code, CampaignStatus.UNSENT)
+            messages.error(self.request, error_message)
+            if self.test_send:
+                return
             # NOTE: Unfortunately any raised django messages after an update() or a save() model operation in a threaded process are ignored
             # As such we can't set campaing to SENDING at the start of the transaction to let it then fall back to UNSENT status naturarily
-            self.campaign.status = CampaignStatus.UNSENT
+            self.campaign.status = campaign_fallback_status
             self.campaign.save() # fallback campaign status
         except:
             logger.exception(f"Problem sending campaign id=\"{self.campaign.id}\" due to an error")
-            self.clear_messages(self.request)
             error_message = _("Failed to send campaign") + f" {self.campaign.name} " + _("due to an error")
             messages.error(self.request, error_message)
             self.campaign.status = CampaignStatus.UNSENT
@@ -97,25 +114,31 @@ class SendCampaignThread(Thread):
                 'created_at': '2023-02-12T16:25:47.924000Z', 'updated_at': '2023-02-12T16:25:49.183000Z'
             }})
         """
-        try:
-            logger.info(f"Checking code: {code}, response: {response}")
-            bulk_email_id = response['bulk_email_id']
-            logger.info(f"Checking status of campaign: {self.campaign.id}, bulk_email_id: {bulk_email_id}")
-            checked_n_amount_of_times = 0
+        # try:
+        logger.info(f"Checking code: {code}, response: {response}")
+        bulk_email_id = response['bulk_email_id']
+        logger.info(f"Checking status of campaign: {self.campaign.id}, bulk_email_id: {bulk_email_id}")
+        checked_n_amount_of_times = 0
 
-            while checked_n_amount_of_times < MAILERSEND_MAX_NO_OF_BULK_STATUS_CHECKS:
-                (code, response) = self.backend.get_bulk_status_by_id(bulk_email_id)
-                logger.info(f"Checking bulk status Code: {code}, and Response: {response}")
-                if "data" in response and "state" in response["data"] and response["data"]["state"] == BULK_STATE_COMPLETED:
-                    return (code, response) # bulk mailout is finished nothing else left to check, let's get out
-                if not code and "message" in response and response['message'] == "Resource not found.":
-                    logger.exception(f"Unable to check back on the bulk email with bulk_email_id: {bulk_email_id}")
-                    # TODO: Should we raise a mailer exception? Test it.
-                checked_n_amount_of_times += 1
-                sleep(MAILERSEND_BULK_STATUS_CHECK_TIMEOUT) # give MailerSend a bit of time before checking the status again
+        while checked_n_amount_of_times < MAILERSEND_MAX_NO_OF_BULK_STATUS_CHECKS:
+            (code, response) = self.backend.get_bulk_status_by_id(bulk_email_id)
+            logger.info(f"Checking bulk status Code: {code}, and Response: {response}")
+            if "data" in response and "state" in response["data"] and response["data"]["state"] == BULK_STATE_COMPLETED:
+                return (code, response) # bulk mailout is finished nothing else left to check, let's get out
+            if not code and "message" in response and response['message'] == ERROR_CODE_BULK_EMAIL_NOT_FOUND:
+                logger.exception(f"Unable to check back on the bulk email with bulk_email_id=\"{bulk_email_id}\"")
+                raise MailerSendException(ERROR_MESSAGE_BULK_EMAIL_NOT_FOUND, ERROR_CODE_BULK_EMAIL_NOT_FOUND)
+            checked_n_amount_of_times += 1
+            messages.success(self.request, _("Sending initated via MailerSend (refresh the page to check the status)."))
+            sleep(MAILERSEND_BULK_STATUS_CHECK_TIMEOUT) # give MailerSend a bit of time before checking the status again
 
-        except:
-            logger.exception(f"Problem with checking status of campaign: {self.campaign.id}")
+        messages.success(self.request, _("Sending of the Campaign timed out"))
+        logger.exception(f"Checking back on the bulk email with bulk_email_id=\"{bulk_email_id}\" timed out")
+        raise MailerSendException(ERROR_MESSAGE_BULK_CHECK_TIMED_OUT, ERROR_CODE_BULK_CHECK_TIMED_OUT)
+            #(None, {'data': {'id': '63ea1292723855014d07c40b', 'state': 'queued', 'total_recipients_count': 4, 'suppressed_recipients_count': 1, 'suppressed_recipients': {'63ea129288b712c3170c7e5d': {'to': [{'email': 'underlivaerable@raquel.yoga', 'name': None, 'reasons': ['on_hold']}]}}, 'validation_errors_count': 2, 'validation_errors': {'message.1': {'to.0.email': ['Recipient domain must match senders domain.']}, 'message.3': {'to.0.email': ['Recipient domain must match senders domain.']}}, 'messages_id': ['63ea129288b712c3170c7e5c', '63ea129288b712c3170c7e5d'], 'created_at': '2023-02-13T10:36:02.165000Z', 'updated_at': '2023-02-13T10:36:02.566000Z'}})
+
+        # except:
+        #     logger.exception(f"Problem with checking status of campaign: {self.campaign.id}")
 
     def seal_campaign(self, validation_errors):
         """
@@ -136,18 +159,12 @@ class SendCampaignThread(Thread):
                 [Receipt(campaign_id=self.campaign.id, contact_id=contact.id, success=(0 if contact.id in unsuccessful_contacts else 1))
                     for contact in self.contacts]
             )
-            # self.campaign.receipts.add(*self.contacts)
+            messages.success(self.request, _("Campaign sent to {} contacts successfully").format(len(self.contacts)-len(unsuccessful_contacts)))
+            if len(unsuccessful_contacts) > 0:
+                messages.warning(self.request, _("Unable to send campaign to {} contacts").format(len(unsuccessful_contacts)))
             self.campaign.status = CampaignStatus.SENT
             self.campaign.sent_date = timezone.now()
             self.campaign.save()
-
-    def clear_messages(self, request):
-        """
-        Clears Django's messages, simply by iterating through them.
-        NOTE: Utilized to clear previous (success) messages before adding an error message
-        """
-        for message in messages.get_messages(request):
-            pass # This iteration is necessary in order to force read any unread messages
 
 
 class MailersendEmailBackend(BaseEmailBackend):
@@ -161,10 +178,14 @@ class MailersendEmailBackend(BaseEmailBackend):
 
     def send_campaign(self, request, campaign, contacts, test_send=False):
         """
-        TODO: Elaborate
+        Sends the campaign to contacts or the test contact (depending on the test_send paramater).
+
+        :param request: HttpRequest - Request to be used to add Django messages
+        :param campaign: Campaign - Emails of which to be sent out to Contacts
+        :param contacts: List of Contacts - Recipients of the campaign's emails
+        :param test_send: boolean - Determines whether to send campaign in test mode or not
         """
-        # campaign.status = CampaignStatus.UNSENT 
-        # campaign.save() # desired transactional fallback state
+
         email_messages = []
         for contact in contacts:
             content = render_to_string(
@@ -178,8 +199,10 @@ class MailersendEmailBackend(BaseEmailBackend):
                 to=[contact.email],
                 reply_to=[self.reply_to],
             ))
+
         campaign_thread = SendCampaignThread(request, campaign, contacts, email_messages, test_send, self)
         campaign_thread.start()
+        sleep(1) # HACK: Give Django Messages a little bit of time before returning back from initiating a campaign mail-out
 
     def get_email_list(self, email_messages):
         """
@@ -222,7 +245,11 @@ class MailersendEmailBackend(BaseEmailBackend):
         # return self.parse_response('429\n{\n\t"message": "Daily API quota limit was reached."\n}')
         # text = "{\"message\":\"The bulk email is being processed.\",\"bulk_email_id\":\"63dc744e837a822014066875\"}"
         # text = "{\"message\":\"The bulk email is being processed.\",\"bulk_email_id\":\"63e9130bdcbf5643050513cb\"}"
-        # return self.parse_response(f"202\n{text}")
+        # return self.parse_response(f"202\n{text}")    
+#         return self.parse_response("""403
+# {
+#     "message": "This action is unauthorized."
+# }""")
 
     def get_bulk_status_by_id(self, bulk_email_id):
         """
@@ -248,7 +275,7 @@ class MailersendEmailBackend(BaseEmailBackend):
             }})
         """
         return self.parse_response(self.mailersend.get_bulk_status_by_id(bulk_email_id))
-        # return (None, {'data': {'id': '63ea1292723855014d07c40b', 'state': 'completed', 'total_recipients_count': 4, 'suppressed_recipients_count': 1, 'suppressed_recipients': {'63ea129288b712c3170c7e5d': {'to': [{'email': 'underlivaerable@raquel.yoga', 'name': None, 'reasons': ['on_hold']}]}}, 'validation_errors_count': 2, 'validation_errors': {'message.1': {'to.0.email': ['Recipient domain must match senders domain.']}, 'message.3': {'to.0.email': ['Recipient domain must match senders domain.']}}, 'messages_id': ['63ea129288b712c3170c7e5c', '63ea129288b712c3170c7e5d'], 'created_at': '2023-02-13T10:36:02.165000Z', 'updated_at': '2023-02-13T10:36:02.566000Z'}})
+        # return (None, {'data': {'id': '63ea1292723855014d07c40b', 'state': 'queued', 'total_recipients_count': 4, 'suppressed_recipients_count': 1, 'suppressed_recipients': {'63ea129288b712c3170c7e5d': {'to': [{'email': 'underlivaerable@raquel.yoga', 'name': None, 'reasons': ['on_hold']}]}}, 'validation_errors_count': 2, 'validation_errors': {'message.1': {'to.0.email': ['Recipient domain must match senders domain.']}, 'message.3': {'to.0.email': ['Recipient domain must match senders domain.']}}, 'messages_id': ['63ea129288b712c3170c7e5c', '63ea129288b712c3170c7e5d'], 'created_at': '2023-02-13T10:36:02.165000Z', 'updated_at': '2023-02-13T10:36:02.566000Z'}})
         # return (None, {'data': {'id': '63e967350ee94e23c308236a', 'state': 'completed', 'total_recipients_count': 4, 'suppressed_recipients_count': 1, 'suppressed_recipients': {'63e967365ec84f8724074ce3': {'to': [{'email': 'underlivaerable@raquel.yoga', 'name': None, 'reasons': ['on_hold']}]}}, 'validation_errors_count': 2, 'validation_errors': {'message.1': {'to.0.email': ['Recipient domain must match senders domain.']}, 'message.3': {'to.0.email': ['Recipient domain must match senders domain.']}}, 'messages_id': ['63e967365ec84f8724074ce2', '63e967365ec84f8724074ce3'], 'created_at': '2023-02-12T22:24:53.707000Z', 'updated_at': '2023-02-12T22:24:54.384000Z'}})
         # return self.parse_response('{"message":"Resource not found."}')
 
@@ -280,9 +307,10 @@ class MailersendEmailBackend(BaseEmailBackend):
             logger.exception(f"Problem with parsing of MailerSend's Response: {response}")
             raise e
         logger.info(f"Parsed to Code: {code}, Message: {message}")
+        if code == ERROR_CODE_UNAUTHORIZED:
+            raise MailerSendException(ERROR_MESSAGE_UNAUTHORIZED, code)
         if code == ERROR_CODE_DAILY_API_QUOTA_LIMIT_REACHED:
             # logger.exception(message['message'])
             # raise Exception(message['message'])
-            raise MailerSendException(message['message'], code) # Let's stop here, no point in proceeding further when out of API calls
+            raise MailerSendException(ERROR_MESSAGE_DAILY_API_QUOTA_LIMIT_REACHED, code) # Let's stop here, no point in proceeding further when out of API calls
         return (code, message)
-
